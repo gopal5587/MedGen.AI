@@ -1,14 +1,25 @@
+import sys
+import os
+print("=== MediScribe.AI API Starting ===", flush=True)
+print(f"Python version: {sys.version}", flush=True)
+print(f"PORT: {os.getenv('PORT', 'not set')}", flush=True)
+
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from transformers import pipeline
-from sentence_transformers import SentenceTransformer
-import faiss, os, glob, re
+import glob, re
+import threading
 from typing import List, Dict, Any
 from io import BytesIO
-from PyPDF2 import PdfReader
+print("Core imports complete", flush=True)
 
 app = FastAPI(title="MediScribe.AI API")
+print("FastAPI app created - server starting...", flush=True)
+
+# Root endpoint for immediate health check (Render port detection)
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "MediScribe.AI API is running"}
 
 # Add CORS middleware
 # Allow frontend origins (add your Render frontend URL here)
@@ -39,26 +50,50 @@ app.add_middleware(
 # Global variables for lazy loading
 summarizer = None
 embedder = None
+faiss_module = None
+docs = []
+meta = []
+index = None
+kb_loaded = False
+kb_lock = threading.Lock()
+ml_lock = threading.Lock()
+
+def get_faiss():
+    """Lazy load faiss module"""
+    global faiss_module
+    if faiss_module is None:
+        import faiss
+        faiss_module = faiss
+    return faiss_module
 
 def get_summarizer():
     global summarizer
-    if summarizer is None:
-        print("Loading summarization model (this may take a minute)...")
-        # Using smaller, faster model
-        summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-        print("Summarization model loaded!")
+    with ml_lock:
+        if summarizer is None:
+            print("Loading summarization model (this may take a minute)...", flush=True)
+            from transformers import pipeline
+            summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+            print("Summarization model loaded!", flush=True)
     return summarizer
 
 def get_embedder():
     global embedder
-    if embedder is None:
-        print("Loading embedding model...")
-        embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        print("Embedding model loaded!")
+    with ml_lock:
+        if embedder is None:
+            print("Loading embedding model...", flush=True)
+            from sentence_transformers import SentenceTransformer
+            embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            print("Embedding model loaded!", flush=True)
     return embedder
 
-print("Initializing embedding model for KB...")
-embedder = get_embedder()
+def get_pdf_reader():
+    """Lazy load PDF reader with backward-compatible fallback."""
+    try:
+        from pypdf import PdfReader
+        return PdfReader
+    except ImportError:
+        from PyPDF2 import PdfReader
+        return PdfReader
 
 # build KB index
 # Try multiple possible KB directory locations
@@ -80,26 +115,43 @@ if not KB_DIR:
     # Default fallback
     KB_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "kb"))
 
-print(f"Looking for KB documents in: {KB_DIR}")
-docs, meta = [], []
-for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
-    text = open(path, "r", encoding="utf-8").read().strip()
-    for i, chunk in enumerate([c.strip() for c in text.replace("\n"," ").split(". ") if c.strip()]):
-        docs.append(chunk)
-        meta.append({"file": os.path.basename(path), "chunk_idx": i})
+def ensure_kb_index():
+    """Load KB files and build FAISS index lazily to keep app startup fast."""
+    global docs, meta, index, kb_loaded
+    if kb_loaded:
+        return
 
-print(f"Loaded {len(docs)} document chunks from {len(set(m['file'] for m in meta))} files")
+    with kb_lock:
+        if kb_loaded:
+            return
 
-# Only create index if we have documents
-if docs:
-    print("Creating FAISS index...")
-    emb = embedder.encode(docs, normalize_embeddings=True)
-    index = faiss.IndexFlatIP(emb.shape[1])
-    index.add(emb)
-    print("FAISS index created successfully!")
-else:
-    print(f"WARNING: No documents found in {KB_DIR}")
-    index = None
+        print(f"Looking for KB documents in: {KB_DIR}")
+        local_docs = []
+        local_meta = []
+        for path in sorted(glob.glob(os.path.join(KB_DIR, "*.txt"))):
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            chunks = [c.strip() for c in text.replace("\n", " ").split(". ") if c.strip()]
+            for i, chunk in enumerate(chunks):
+                local_docs.append(chunk)
+                local_meta.append({"file": os.path.basename(path), "chunk_idx": i})
+
+        docs = local_docs
+        meta = local_meta
+        print(f"Loaded {len(docs)} document chunks from {len(set(m['file'] for m in meta)) if meta else 0} files")
+
+        if docs:
+            emb = get_embedder().encode(docs, normalize_embeddings=True)
+            faiss = get_faiss()
+            local_index = faiss.IndexFlatIP(emb.shape[1])
+            local_index.add(emb)
+            index = local_index
+            print("FAISS index created successfully!")
+        else:
+            print(f"WARNING: No documents found in {KB_DIR}")
+            index = None
+
+        kb_loaded = True
 
 class SummarizeReq(BaseModel):
     note: str
@@ -118,6 +170,7 @@ def summarize(inp: SummarizeReq):
     return {"summary": s}
 
 def retrieve(note: str, k: int):
+    ensure_kb_index()
     if not docs or index is None:
         return []
     emb = get_embedder()
@@ -507,6 +560,7 @@ def summarize_hypothesize(inp: SHReq):
 @app.post("/extract_pdf")
 async def extract_pdf(file: UploadFile = File(...)):
     content = await file.read()
+    PdfReader = get_pdf_reader()
     pdf = PdfReader(BytesIO(content))
     text = "\n".join([p.extract_text() or "" for p in pdf.pages])
     return {"text": text.strip()}
